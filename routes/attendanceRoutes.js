@@ -5,20 +5,174 @@ const Attendance   = require('../models/Attendance');
 const LeaveRequest = require('../models/LeaveRequest');
 
 // ─────────────────────────────────────────────
-// ATTENDANCE LOGS
+// MOBILE BACKEND PROXY CONFIG
+// Mobile employees check in/out from the React Native app. The records live
+// in the mobile backend's Attendance collection. We forward GET /logs and
+// /stats requests there and reshape the response into the field names the
+// existing HRMS Attendance.jsx page already expects — so no UI changes.
+// ─────────────────────────────────────────────
+const MOBILE_API   = (process.env.MOBILE_API_URL    || 'https://backend-emqy.onrender.com').replace(/\/+$/, '');
+const ADMIN_SECRET =  process.env.MOBILE_ADMIN_SECRET || '';
+const FETCH_TIMEOUT_MS = 30_000;
+
+async function fwdMobile(path) {
+  if (typeof fetch !== 'function') {
+    throw new Error('global fetch is not available — Node 18+ required.');
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(MOBILE_API + path, {
+      signal:  controller.signal,
+      headers: { 'x-admin-secret': ADMIN_SECRET },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Map mobile-app status → HRMS UI status code. */
+function mapStatus(s) {
+  switch (String(s || '').toLowerCase()) {
+    case 'present':    return 'On Time';
+    case 'late':       return 'Late';
+    case 'leave':      return 'Absent';
+    case 'permission': return 'Half Day';
+    case 'absent':     return 'Absent';
+    case 'halfday':    return 'Half Day';
+    default:           return s || 'On Time';
+  }
+}
+
+/** Format a Mongo Date → "09:05 AM". */
+function fmtTime(d) {
+  if (!d) return '--:--';
+  try {
+    const dt = new Date(d);
+    if (isNaN(dt.getTime())) return '--:--';
+    let h = dt.getHours();
+    const m = dt.getMinutes();
+    const ap = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} ${ap}`;
+  } catch { return '--:--'; }
+}
+
+/** Build "8h 25m" from check-in/out (or workedHours if present). */
+function fmtWorked(att) {
+  if (typeof att.workedHours === 'number' && att.workedHours > 0) {
+    const h = Math.floor(att.workedHours);
+    const m = Math.round((att.workedHours - h) * 60);
+    return `${h}h ${m}m`;
+  }
+  if (att.checkIn && att.checkOut) {
+    const ms = new Date(att.checkOut) - new Date(att.checkIn);
+    if (ms > 0) {
+      const totalMin = Math.floor(ms / 60000);
+      const h = Math.floor(totalMin / 60);
+      const m = totalMin % 60;
+      return `${h}h ${m}m`;
+    }
+  }
+  return '0h';
+}
+
+/** Initials + deterministic colour for the avatar tile. */
+const PALETTE = ['#4299E1', '#48BB78', '#ED8936', '#9F7AEA', '#F56565', '#38B2AC', '#ECC94B'];
+function colorFor(name) {
+  const s = String(name || '');
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+function initialsFor(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '??';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+/** Reshape a mobile attendance doc into the HRMS-UI shape. */
+function reshapeMobileAttendance(att) {
+  const fullName =
+    att.user?.name ||
+    [att.user?.firstName, att.user?.lastName].filter(Boolean).join(' ') ||
+    'Unknown';
+  return {
+    _id:          att._id,
+    employeeId:   att.user?.employeeId || '',
+    employeeName: fullName,
+    avatar:       initialsFor(fullName),
+    color:        colorFor(fullName),
+    role:         att.user?.designation || '',
+    department:   att.user?.department  || '',
+    email:        att.user?.email       || '',
+    date:         att.date,
+    checkIn:      fmtTime(att.checkIn),
+    checkOut:     fmtTime(att.checkOut),
+    workHours:    fmtWorked(att),
+    status:       mapStatus(att.status),
+    autoCheckedOut: !!att.autoCheckedOut,
+    lat:          att.checkInLat,
+    lng:          att.checkInLng,
+  };
+}
+
+// ─────────────────────────────────────────────
+// ATTENDANCE LOGS  (now proxies to mobile backend)
 // ─────────────────────────────────────────────
 
-// GET /api/attendance/logs?search=&date=YYYY-MM-DD
+// GET /api/attendance/logs?date=YYYY-MM-DD&search=&month=&year=
 router.get('/logs', async (req, res) => {
+  // Fallback to local DB if proxy not configured — avoids breaking dev.
+  if (!ADMIN_SECRET) {
+    try {
+      const { search, date } = req.query;
+      const query = { isActive: true };
+      if (date)   query.date = date;
+      if (search) query.employeeName = { $regex: search, $options: 'i' };
+      const logs = await Attendance.find(query).sort({ createdAt: -1 });
+      return res.status(200).json({ success: true, data: logs, source: 'local' });
+    } catch (err) {
+      return res.status(500).json({ success: false, message: err.message });
+    }
+  }
+
   try {
-    const { search, date } = req.query;
-    const query = { isActive: true };
-    if (date)   query.date = date;
-    if (search) query.employeeName = { $regex: search, $options: 'i' };
-    const logs = await Attendance.find(query).sort({ createdAt: -1 });
-    res.status(200).json({ success: true, data: logs });
+    const q = new URLSearchParams();
+    if (req.query.date)  q.set('date',  req.query.date);
+    if (req.query.month) q.set('month', req.query.month);
+    if (req.query.year)  q.set('year',  req.query.year);
+    if (req.query.limit) q.set('limit', req.query.limit);
+    const qs = q.toString() ? `?${q.toString()}` : '';
+
+    const r    = await fwdMobile(`/api/attendance/admin/all${qs}`);
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      return res.status(r.status).json({
+        success: false,
+        message: data?.message || `Mobile API responded ${r.status}`,
+      });
+    }
+    let items = Array.isArray(data.items) ? data.items.map(reshapeMobileAttendance) : [];
+
+    // Optional client-side text search across name/email/employeeId.
+    if (req.query.search) {
+      const s = String(req.query.search).toLowerCase();
+      items = items.filter(it =>
+        it.employeeName.toLowerCase().includes(s) ||
+        it.email.toLowerCase().includes(s) ||
+        it.employeeId.toLowerCase().includes(s)
+      );
+    }
+
+    res.status(200).json({ success: true, data: items, source: 'mobile', total: items.length });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    console.error('[attendance/logs proxy]', err.message);
+    res.status(502).json({
+      success: false,
+      message: 'Could not reach the mobile backend. ' + err.message,
+    });
   }
 });
 
@@ -73,17 +227,40 @@ router.delete('/logs/:id', async (req, res) => {
 
 // GET /api/attendance/stats?date=YYYY-MM-DD
 router.get('/stats', async (req, res) => {
+  const date = req.query.date || new Date().toISOString().split('T')[0];
+
+  // Re-use the proxy reader so stats and the table agree.
+  async function readLogs() {
+    if (!ADMIN_SECRET) {
+      return (await Attendance.find({ date })).map(l => ({ status: l.status }));
+    }
+    const r = await fwdMobile(`/api/attendance/admin/all?date=${encodeURIComponent(date)}`);
+    if (!r.ok) throw new Error(`Mobile API responded ${r.status}`);
+    const data = await r.json().catch(() => ({}));
+    return (data.items || []).map(reshapeMobileAttendance);
+  }
+
   try {
-    const date  = req.query.date || new Date().toISOString().split('T')[0];
-    const logs  = await Attendance.find({ date });
+    const logs    = await readLogs();
     const total   = logs.length;
     const onTime  = logs.filter(l => l.status === 'On Time').length;
     const late    = logs.filter(l => l.status === 'Late').length;
     const absent  = logs.filter(l => l.status === 'Absent').length;
     const halfDay = logs.filter(l => l.status === 'Half Day').length;
     const pct = n => total > 0 ? ((n / total) * 100).toFixed(1) + '%' : '0%';
-    res.status(200).json({ success: true, data: { date, total, onTime: { count: onTime, percentage: pct(onTime) }, late: { count: late, percentage: pct(late) }, absent: { count: absent, percentage: pct(absent) }, halfDay: { count: halfDay, percentage: pct(halfDay) } } });
+    res.status(200).json({
+      success: true,
+      data: {
+        date,
+        total,
+        onTime:  { count: onTime,  percentage: pct(onTime)  },
+        late:    { count: late,    percentage: pct(late)    },
+        absent:  { count: absent,  percentage: pct(absent)  },
+        halfDay: { count: halfDay, percentage: pct(halfDay) },
+      },
+    });
   } catch (err) {
+    console.error('[attendance/stats]', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
