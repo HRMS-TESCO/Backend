@@ -8,7 +8,7 @@ const COLORS = ['#4299E1','#9F7AEA','#4CAA17','#ECC94B','#F687B3','#ED8936','#38
 // GET /api/departments — all active departments
 router.get('/', async (req, res) => {
   try {
-    const departments = await Department.find({ isActive: true }).sort({ createdAt: -1 });
+    const departments = await Department.find({ isActive: { $ne: false } }).sort({ createdAt: -1 });
     res.status(200).json({ success: true, data: departments });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

@@ -1,4 +1,4 @@
-// routes/employeeRoutes.js — Employee CRUD with safe populate
+// routes/employeeRoutes.js
 const express     = require('express');
 const router      = express.Router();
 const mongoose    = require('mongoose');
@@ -9,12 +9,11 @@ const AccessRole  = require('../models/AccessRole');
 
 const isObjectId = v => v && mongoose.Types.ObjectId.isValid(String(v)) && String(v).length === 24;
 
-// Safely resolve dept/desig/role from either ObjectId or plain string
 const resolveEmployee = (e, deptMap, desigMap, roleMap) => ({
   ...e,
-  department:  isObjectId(e.department)  ? (deptMap[String(e.department)]   || { name: String(e.department  || '—') }) : { name: String(e.department  || '—') },
-  designation: isObjectId(e.designation) ? (desigMap[String(e.designation)] || { title: String(e.designation || '—') }) : { title: String(e.designation || '—') },
-  accessRole:  isObjectId(e.accessRole)  ? (roleMap[String(e.accessRole)]   || { name: String(e.accessRole  || '—') })  : { name: String(e.accessRole  || '—') },
+  department:  isObjectId(e.department)  ? (deptMap[String(e.department)]   || { name: '—' })  : { name: String(e.department  || '—') },
+  designation: isObjectId(e.designation) ? (desigMap[String(e.designation)] || { title: '—' }) : { title: String(e.designation || '—') },
+  accessRole:  isObjectId(e.accessRole)  ? (roleMap[String(e.accessRole)]   || { name: '—' })  : { name: String(e.accessRole  || '—') },
 });
 
 const loadLookupMaps = async () => {
@@ -23,10 +22,11 @@ const loadLookupMaps = async () => {
     Designation.find({}).lean(),
     AccessRole.find({}).lean(),
   ]);
-  const deptMap  = Object.fromEntries(depts.map(d  => [String(d._id), d]));
-  const desigMap = Object.fromEntries(desigs.map(d => [String(d._id), d]));
-  const roleMap  = Object.fromEntries(roles.map(r  => [String(r._id), r]));
-  return { deptMap, desigMap, roleMap, depts, desigs };
+  return {
+    deptMap:  Object.fromEntries(depts.map(d  => [String(d._id), d])),
+    desigMap: Object.fromEntries(desigs.map(d => [String(d._id), d])),
+    roleMap:  Object.fromEntries(roles.map(r  => [String(r._id), r])),
+  };
 };
 
 // ── GET /api/employees ──────────────────────────────────────────
@@ -36,7 +36,6 @@ router.get('/', async (req, res) => {
     const limit  = Math.min(200, parseInt(req.query.limit) || 20);
     const skip   = (page - 1) * limit;
     const search = req.query.search;
-
     const filter = {};
     if (search) {
       filter.$or = [
@@ -46,18 +45,15 @@ router.get('/', async (req, res) => {
         { employeeId: { $regex: search, $options: 'i' } },
       ];
     }
-
-    const [total, rawEmployees] = await Promise.all([
+    const [total, raw] = await Promise.all([
       Employee.countDocuments(filter),
       Employee.find(filter).lean().sort({ createdAt: -1 }).skip(skip).limit(limit),
     ]);
-
     const { deptMap, desigMap, roleMap } = await loadLookupMaps();
-    const employees = rawEmployees.map(e => resolveEmployee(e, deptMap, desigMap, roleMap));
-
+    const employees = raw.map(e => resolveEmployee(e, deptMap, desigMap, roleMap));
     return res.status(200).json({ success: true, total, page, pages: Math.ceil(total / limit), employees });
   } catch (err) {
-    console.error('[EMPLOYEE] List error:', err);
+    console.error('[EMPLOYEE] List error:', err.message);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -90,68 +86,129 @@ router.get('/:id', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const b = req.body;
+    console.log('[EMPLOYEE POST] Received:', b.firstName, b.lastName, '| dept:', b.department, '| desig:', b.designation);
 
-    // Resolve department: accept ObjectId OR name string
+    if (!b.firstName || !b.lastName) {
+      return res.status(400).json({ success: false, message: 'firstName and lastName are required' });
+    }
+
+    // Drop stale unique indexes on username/email so they never block inserts
+    try {
+      const indexes = await Employee.collection.indexes();
+      for (const idx of indexes) {
+        const keys = Object.keys(idx.key || {});
+        if (idx.unique && (keys.includes('username') || keys.includes('email'))) {
+          await Employee.collection.dropIndex(idx.name);
+          console.log('[EMPLOYEE POST] Dropped stale unique index:', idx.name);
+        }
+      }
+    } catch (_) {}
+
+    // ── Resolve department — only match existing, never auto-create ──
     let deptId = null;
     if (b.department) {
       if (isObjectId(b.department)) {
         deptId = b.department;
       } else {
         const dept = await Department.findOne({ name: { $regex: new RegExp(`^${b.department}$`, 'i') } }).lean();
-        deptId = dept ? dept._id : null;
-        // If department name not found in DB, create it on the fly
-        if (!deptId) {
-          const newDept = await Department.create({ name: b.department });
-          deptId = newDept._id;
+        if (dept) {
+          deptId = dept._id;
+          console.log('[EMPLOYEE POST] Matched dept:', dept.name, dept._id);
+        } else {
+          console.log('[EMPLOYEE POST] Dept not found in DB, skipping:', b.department);
         }
       }
     }
 
-    // Resolve designation: accept ObjectId OR title string
+    // ── Resolve designation — only match existing, never auto-create ──
     let desigId = null;
     if (b.designation) {
       if (isObjectId(b.designation)) {
         desigId = b.designation;
       } else {
         const desig = await Designation.findOne({ title: { $regex: new RegExp(`^${b.designation}$`, 'i') } }).lean();
-        desigId = desig ? desig._id : null;
-        // If designation not found, create it on the fly
-        if (!desigId) {
-          const newDesig = await Designation.create({ title: b.designation, dept: b.department || 'General' });
-          desigId = newDesig._id;
+        if (desig) {
+          desigId = desig._id;
+          console.log('[EMPLOYEE POST] Matched desig:', desig.title, desig._id);
+        } else {
+          console.log('[EMPLOYEE POST] Desig not found in DB, skipping:', b.designation);
         }
+      }
+    }
+
+    // ── Always generate a unique username from name + full epoch timestamp ──
+    // Never use what the frontend sends — epoch guarantees no clash with old indexes
+    const namePart = `${b.firstName}${b.lastName}`.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const username = `${namePart}_${Date.now()}`;
+
+    // ── Email: null if blank, modify if exact duplicate ───────────
+    const rawEmail = (b.email || '').toLowerCase().trim();
+    let email = rawEmail || null;
+    if (email) {
+      const existing = await Employee.findOne({ email }).lean();
+      if (existing) {
+        const [local, domain] = email.split('@');
+        email = `${local}_${Date.now().toString().slice(-6)}@${domain}`;
+      }
+    }
+
+    // ── EmployeeId: check conflict and suffix if needed ───────────
+    let employeeId = (b.employeeId || '').trim().toUpperCase() || undefined;
+    if (employeeId) {
+      const existing = await Employee.findOne({ employeeId }).lean();
+      if (existing) {
+        employeeId = `${employeeId}-${Date.now().toString().slice(-4)}`;
+        console.log('[EMPLOYEE POST] EmployeeId conflict, using:', employeeId);
       }
     }
 
     const payload = {
       firstName:      b.firstName,
       lastName:       b.lastName,
-      username:       b.username,
-      password:       b.password || 'password123',
-      email:          b.email,
-      phone:          b.phone,
-      address:        b.address || { street: b.street || '', city: b.city || '', state: b.state || '', zipCode: b.zipCode || '', country: b.country || '' },
-      employeeId:     b.employeeId,
+      username:       username,
+      password:       b.password || null,
+      email:          email,
+      phone:          b.phone || '',
+      address:        b.address || {},
+      employeeId:     employeeId,
       department:     deptId,
       designation:    desigId,
       employmentType: b.employmentType || '',
       joiningDate:    b.joiningDate,
       salary:         Number(b.salary) || 0,
-      assignedTo:     b.assignedTo,
-      education:      b.education || { degree: b.degree || '', university: b.university || '', fieldOfStudy: b.fieldOfStudy || '', graduationYear: Number(b.graduationYear) || 2020 },
-      status:         b.status || 'Active',
+      assignedTo:     b.assignedTo || '',
+      education:      b.education || {},
+      status:         'Active',
       isActive:       true,
     };
 
+    console.log('[EMPLOYEE POST] Saving with username:', username, '| employeeId:', employeeId);
     const employee = await Employee.create(payload);
-    console.log(`[EMPLOYEE] Created: ${employee.employeeId} — ${employee.firstName} ${employee.lastName}`);
+    console.log('[EMPLOYEE POST] ✅ Created:', employee.employeeId, employee.firstName, employee.lastName);
+
+    // ── Update department & designation headcounts (only if matched) ─
+    if (deptId) {
+      const deptCount = await Employee.countDocuments({ department: deptId });
+      await Department.findByIdAndUpdate(deptId, { count: deptCount });
+      console.log('[EMPLOYEE POST] Dept count updated:', deptCount);
+    }
+    if (desigId) {
+      const desigCount = await Employee.countDocuments({ designation: desigId });
+      await Designation.findByIdAndUpdate(desigId, { count: desigCount });
+      console.log('[EMPLOYEE POST] Desig count updated:', desigCount);
+    }
+
     return res.status(201).json({ success: true, message: 'Employee created successfully', data: employee.toSafeObject() });
+
   } catch (err) {
-    console.error('[EMPLOYEE] Create error:', err.message);
-    if (err.name === 'ValidationError') return res.status(400).json({ success: false, message: 'Validation failed: ' + Object.values(err.errors).map(e => e.message).join(', ') });
+    console.error('[EMPLOYEE POST] ❌', err.name, ':', err.message);
+    if (err.name === 'ValidationError') {
+      const msg = Object.values(err.errors).map(e => e.message).join(', ');
+      return res.status(400).json({ success: false, message: 'Validation failed: ' + msg });
+    }
     if (err.code === 11000) {
       const field = Object.keys(err.keyPattern || {})[0] || 'field';
-      return res.status(400).json({ success: false, message: `${field} already exists. Please use a different value.` });
+      return res.status(400).json({ success: false, message: `${field} already exists — please restart the backend and try again.` });
     }
     return res.status(500).json({ success: false, message: err.message });
   }
@@ -163,10 +220,9 @@ router.put('/:id', async (req, res) => {
     const payload = { ...req.body };
     delete payload.password;
     Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
-
     const employee = await Employee.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: false });
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-    return res.status(200).json({ success: true, message: 'Employee updated successfully', employee: employee.toSafeObject() });
+    return res.status(200).json({ success: true, message: 'Employee updated', employee: employee.toSafeObject() });
   } catch (err) {
     if (err.name === 'CastError') return res.status(400).json({ success: false, message: 'Invalid employee id' });
     if (err.code === 11000) return res.status(400).json({ success: false, message: 'Duplicate value' });
@@ -183,8 +239,9 @@ router.delete('/:id', async (req, res) => {
       { new: true }
     );
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-    return res.status(200).json({ success: true, message: `Employee "${employee.firstName} ${employee.lastName}" removed` });
+    return res.status(200).json({ success: true, message: 'Employee deleted' });
   } catch (err) {
+    if (err.name === 'CastError') return res.status(400).json({ success: false, message: 'Invalid employee id' });
     return res.status(500).json({ success: false, message: err.message });
   }
 });

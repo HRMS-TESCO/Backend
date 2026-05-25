@@ -82,26 +82,28 @@ router.get('/attendance', async (req, res) => {
       grouped[key].leavedays += Math.max(0, Math.ceil((to - from) / 86400000) + 1);
     });
 
-    // Build rows
-    const rows = Object.values(grouped).map(g => {
-      const emp = g.empDoc;
-      return {
-        employeeId:   g.employeeId,
-        employeeName: g.employeeName,
-        avatar:       g.avatar,
-        color:        g.color,
-        department:   emp ? getDept(emp.department)   : '—',
-        designation:  emp ? getDesig(emp.designation) : '—',
-        manager:      emp?.assignedTo || '—',
-        status:       emp?.status     || 'Active',
-        present:      g.present,
-        late:         g.late,
-        absent:       g.absent,
-        halfDay:      g.halfDay,
-        leavedays:    g.leavedays,
-        lop:          Math.max(0, g.absent - g.leavedays),
-      };
-    });
+    // Build rows — only include employees with at least 1 present or late day
+    const rows = Object.values(grouped)
+      .filter(g => (g.present + g.late) > 0)
+      .map(g => {
+        const emp = g.empDoc;
+        return {
+          employeeId:   g.employeeId,
+          employeeName: g.employeeName,
+          avatar:       g.avatar,
+          color:        g.color,
+          department:   emp ? getDept(emp.department)   : '—',
+          designation:  emp ? getDesig(emp.designation) : '—',
+          manager:      emp?.assignedTo || '—',
+          status:       emp?.status     || 'Active',
+          present:      g.present,
+          late:         g.late,
+          absent:       g.absent,
+          halfDay:      g.halfDay,
+          leavedays:    g.leavedays,
+          lop:          Math.max(0, g.absent - g.leavedays),
+        };
+      });
 
     const totalPresent   = rows.reduce((s, r) => s + r.present,   0);
     const totalLate      = rows.reduce((s, r) => s + r.late,      0);

@@ -11,37 +11,35 @@ const addressSchema = new mongoose.Schema(
 
 const educationSchema = new mongoose.Schema(
   {
-    degree: {
-      type: String, required: [true, 'Degree is required'],
-      enum: { values: ['High School', "Associate's Degree", "Bachelor's Degree", "Master's Degree", 'PhD / Doctorate', 'Other Professional Certificate'], message: 'Invalid degree value' },
-    },
-    university:     { type: String, required: [true, 'University is required'], trim: true, minlength: 2 },
-    fieldOfStudy:   { type: String, required: [true, 'Field of study is required'], trim: true },
-    graduationYear: { type: Number, required: [true, 'Graduation year is required'], min: 1950, max: 2030 },
+    degree:         { type: String, default: '' },
+    university:     { type: String, default: '', trim: true },
+    fieldOfStudy:   { type: String, default: '', trim: true },
+    graduationYear: { type: Number, default: 2020 },
   },
   { _id: false }
 );
 
 const employeeSchema = new mongoose.Schema(
   {
-    firstName:      { type: String, required: [true, 'First name is required'], trim: true, minlength: 2, maxlength: 40 },
-    lastName:       { type: String, required: [true, 'Last name is required'],  trim: true, minlength: 1, maxlength: 40 },
-    username:       { type: String, required: [true, 'Username is required'], trim: true, lowercase: true, unique: true, minlength: 3, maxlength: 30,
-                      match: [/^[a-z0-9_.-]+$/, 'Username can only contain letters, numbers, dot, underscore and hyphen'] },
-    password:       { type: String, required: [true, 'Password is required'], minlength: 6, select: false },
-    email:          { type: String, required: [true, 'Email is required'], unique: true, lowercase: true, trim: true,
-                      match: [/^[^\s@]+@[^\s@]+\.[^\s@]+$/, 'Please provide a valid email'] },
-    phone:          { type: String, required: [true, 'Phone is required'], trim: true,
-                      validate: { validator: v => /^\d{10,15}$/.test(v.replace(/[\s-]/g, '')), message: 'Phone must be at least 10 digits' } },
+    firstName:      { type: String, required: [true, 'First name is required'], trim: true },
+    lastName:       { type: String, required: [true, 'Last name is required'],  trim: true },
+    // username — NOT unique at model level; route guarantees uniqueness via timestamp suffix
+    username:       { type: String, trim: true, lowercase: true, default: null },
+    // password — no minlength, nullable
+    password:       { type: String, select: false, default: null },
+    // email — NOT unique at model level; multiple employees can share or have null email
+    email:          { type: String, lowercase: true, trim: true, default: null },
+    phone:          { type: String, trim: true, default: '' },
     address:        { type: addressSchema, default: () => ({}) },
+    // employeeId — unique but sparse; route handles conflicts before reaching model
     employeeId:     { type: String, unique: true, sparse: true, trim: true, uppercase: true },
     department:     { type: mongoose.Schema.Types.ObjectId, ref: 'Department', required: [true, 'Department is required'] },
     designation:    { type: mongoose.Schema.Types.ObjectId, ref: 'Designation', default: null },
     employmentType: { type: String, enum: ['Full-time', 'Part-time', 'Contract', 'Intern', ''], default: '' },
     joiningDate:    { type: Date, required: [true, 'Joining date is required'] },
-    salary:         { type: Number, required: [true, 'Salary is required'], min: 0 },
-    assignedTo:     { type: String, required: [true, 'Manager assignment is required'], trim: true },
-    education:      { type: educationSchema, required: true },
+    salary:         { type: Number, default: 0, min: 0 },
+    assignedTo:     { type: String, default: '', trim: true },
+    education:      { type: educationSchema, default: () => ({}) },
     status:         { type: String, enum: ['Active', 'Inactive', 'On Leave', 'Terminated'], default: 'Active' },
     isActive:       { type: Boolean, default: true },
     accessRole:     { type: mongoose.Schema.Types.ObjectId, ref: 'AccessRole', default: null },
@@ -65,9 +63,9 @@ employeeSchema.pre('validate', async function () {
   }
 });
 
-// Hash password before save
+// Hash password before save (only if set and modified)
 employeeSchema.pre('save', async function () {
-  if (!this.isModified('password')) return;
+  if (!this.password || !this.isModified('password')) return;
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
 });
